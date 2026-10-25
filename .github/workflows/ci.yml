@@ -157,7 +157,7 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v6
         with:
           args: >
-            -Dsonar.projectKey=vulnerable-java-application
+            -Dsonar.projectKey=Java-gradle-project
             -Dsonar.sources=src/main/java
             -Dsonar.java.binaries=build/classes/java/main
             -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml
