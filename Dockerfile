@@ -1,23 +1,14 @@
-FROM gradle:8.7.0-jdk21 AS builder
-COPY --chown=gradle:gradle . /home/gradle/src
-WORKDIR /home/gradle/src
-RUN gradle bootJar --no-daemon
-
-
-FROM amazoncorretto:21-alpine-jdk
-LABEL org.opencontainers.image.source="https://github.com/DataDog/vulnerable-java-application/"
-EXPOSE 8080
-RUN mkdir /app
+# Stage 1: build with the project's OWN Gradle (via wrapper) + JDK 21
+FROM eclipse-temurin:21-jdk AS build
 WORKDIR /app
-COPY --from=builder /home/gradle/src/build/libs/*.jar /app/spring-boot-application.jar
+COPY . .
+RUN chmod +x gradlew && ./gradlew bootJar -x test --no-daemon
 
-# Install Datadog agent
-RUN wget -O dd-java-agent.jar https://github.com/DataDog/dd-trace-java/releases/download/v1.35.0/dd-java-agent.jar && \
-    echo "14f6c325679c7f11db6bc3dc7baba98abd005c1865bd9c61a2a8d560f1a65b26  dd-java-agent.jar" > SHA256SUMS && \
-    sha256sum -c SHA256SUMS
-
-# Utility
-RUN apk add curl wget
-RUN mkdir -p /tmp/files && echo "hello" > /tmp/files/hello.txt && echo "world" > /tmp/files/foo.txt
-
-CMD ["java", "-javaagent:/app/dd-java-agent.jar", "-jar", "/app/spring-boot-application.jar"]
+# Stage 2: small JRE runtime, non-root
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /app/build/libs/*.jar app.jar
+RUN useradd -m appuser
+USER appuser
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
