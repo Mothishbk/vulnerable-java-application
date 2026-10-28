@@ -1,18 +1,22 @@
+# Vulnerable Java App (Gradle, Java 21) — same shape as the BoardGame pipeline:
+# every scanner emits SARIF (-> GitHub Security) + a downloadable artifact,
+# no OWASP Dependency-Check, plus a Docker build/scan/push job.
+# Project files are at the repo ROOT, so no working-directory is needed.
 name: Vulnerable-Java-Application CI
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:            # "Run workflow" button for manual test runs
+  workflow_dispatch:            # "Run workflow" button for manual runs
 
 permissions:
   contents: read
+  security-events: write        # required to upload SARIF to the Security tab
 
 env:
   APP_NAME: Vulnerable Java Application
 
-# Project files are at the repo root, so no working-directory is needed
 jobs:
   build:
     name: Build, Test and Security Scans
@@ -30,12 +34,20 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y gitleaks
 
+      # Gitleaks: one tool, two reports — CSV (readable) + SARIF (Security tab)
       - name: Code Security check (Gitleaks)
         run: |
-          gitleaks detect --no-git --source . \
-            --report-format csv \
-            --report-path gitleaks-report.csv \
-            --redact
+          gitleaks detect --no-git --source . --redact --exit-code 0 \
+            --report-format csv   --report-path gitleaks-report.csv
+          gitleaks detect --no-git --source . --redact --exit-code 0 \
+            --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload Gitleaks SARIF to Security tab
+        if: ${{ !cancelled() && hashFiles('gitleaks.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
 
       - name: Install Trivy
         run: |
@@ -45,17 +57,30 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
-      - name: Trivy secret scan
-        run: trivy fs --scanners secret --offline-scan --exit-code 0 --skip-files README.md --format json --output trivy-secret-report.json .
+      # Scan ONCE to JSON, then convert the same result to SARIF (no re-scan)
+      - name: Trivy secret scan (JSON + SARIF)
+        run: |
+          trivy fs --scanners secret --offline-scan --skip-files README.md \
+            --exit-code 0 --format json --output trivy-secret-report.json .
+          trivy convert --format sarif --output trivy-secret.sarif trivy-secret-report.json
 
-      - name: Upload secret scan reports
+      - name: Upload Trivy secret SARIF to Security tab
+        if: ${{ !cancelled() && hashFiles('trivy-secret.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-secret.sarif
+          category: trivy-secret
+
+      - name: Upload secret scan reports (artifacts)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-reports-secrets
           path: |
             gitleaks-report.csv
+            gitleaks.sarif
             trivy-secret-report.json
+            trivy-secret.sarif
           if-no-files-found: warn
           retention-days: 7
 
@@ -71,7 +96,6 @@ jobs:
         run: chmod +x gradlew
 
       # Runs tests and creates the JaCoCo coverage report
-      # (needs the jacoco plugin added to build.gradle)
       - name: Perform Unit Test
         run: ./gradlew test jacocoTestReport --no-daemon
 
@@ -86,40 +110,28 @@ jobs:
           retention-days: 7
 
       # ---------- 3) Dependency vulnerability scanning (after build) ----------
-      # Trivy reads gradle.lockfile, so it doesn't need Maven Central
-      - name: Trivy vulnerability scan
-        run: trivy fs --scanners vuln --format json --output trivy-vuln-report.json .
+      # Trivy reads gradle.lockfile, so it doesn't need to reach Maven Central
+      - name: Trivy vulnerability scan (JSON + SARIF)
+        run: |
+          trivy fs --scanners vuln --exit-code 0 \
+            --format json --output trivy-vuln-report.json .
+          trivy convert --format sarif --output trivy-vuln.sarif trivy-vuln-report.json
 
-      - name: Upload vulnerability scan report
+      - name: Upload Trivy vuln SARIF to Security tab
+        if: ${{ !cancelled() && hashFiles('trivy-vuln.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-vuln.sarif
+          category: trivy-vuln
+
+      - name: Upload vulnerability scan reports (artifacts)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-reports-vuln
-          path: trivy-vuln-report.json
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: OWASP Dependency-Check Scan
-        uses: dependency-check/Dependency-Check_Action@main
-        env:
-          JAVA_HOME: /opt/jdk          # stops setup-java's JAVA_HOME breaking the action's container
-        with:
-          project: 'vulnerable-java-application'
-          path: '.'
-          format: 'HTML'
-          out: 'reports'
-          args: >
-            --format JSON
-            --exclude "**/reports/**"
-            --exclude "**/.gradle/**"
-            --nvdApiKey ${{ secrets.NVD_API_KEY }}
-
-      - name: Upload Dependency-Check report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-check-report
-          path: reports
+          path: |
+            trivy-vuln-report.json
+            trivy-vuln.sarif
           if-no-files-found: warn
           retention-days: 7
 
@@ -157,7 +169,7 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v6
         with:
           args: >
-            -Dsonar.projectKey=Java-gradle-project
+            -Dsonar.projectKey=Java-vuln-project
             -Dsonar.sources=src/main/java
             -Dsonar.java.binaries=build/classes/java/main
             -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml
@@ -178,3 +190,55 @@ jobs:
       - name: Show Quality Gate status
         if: always()
         run: echo "Quality Gate status is ${{ steps.qg.outputs.quality-gate-status }}"
+
+  docker:
+    name: Docker Build, Scan & Push
+    runs-on: ubuntu-latest
+    needs: [build, sonarqube]        # only after tests, scans and Quality Gate pass
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/vulnerable-java-app:${{ github.sha }}
+
+    steps:
+      - name: Code Checkout Step       # multi-stage Dockerfile builds from source
+        uses: actions/checkout@v5
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
+
+      - name: Docker Build
+        run: docker build -t "$IMAGE" .
+
+      # Scan ONCE to JSON, convert to SARIF (both kept)
+      - name: Trivy image scan (JSON + SARIF)
+        run: |
+          trivy image "$IMAGE" --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 0 --format json --output trivy-image-report.json
+          trivy convert --format sarif --output trivy-image.sarif trivy-image-report.json
+
+      - name: Upload Trivy image SARIF to Security tab
+        if: ${{ !cancelled() && hashFiles('trivy-image.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload image scan reports (artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-image
+          path: |
+            trivy-image-report.json
+            trivy-image.sarif
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Login & Push to Docker Hub
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          docker push "$IMAGE"
